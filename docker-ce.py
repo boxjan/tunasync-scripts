@@ -12,7 +12,6 @@ import traceback
 import requests
 from pyquery import PyQuery as pq
 
-
 BASE_URL = os.getenv("TUNASYNC_UPSTREAM_URL", "https://download.docker.com/")
 WORKING_DIR = os.getenv("TUNASYNC_WORKING_DIR")
 SYNC_USER_AGENT = os.getenv("SYNC_USER_AGENT", "Docker-ce Syncing Tool (https://github.com/tuna/tunasync-scripts)/1.0")
@@ -25,6 +24,56 @@ requests.utils.default_user_agent = lambda: SYNC_USER_AGENT
 requests.adapters.DEFAULT_RETRIES = 3
 
 REL_URL_RE = re.compile(r"https?:\/\/.+?\/(.+?)(\/index\.html)?$")
+REDIS_KEY_PREFIX = "mirrors:docker-ce:etag:"
+
+class KvStore(object):
+    _instance_lock = threading.Lock()
+
+
+    def __init__(self, redis_uri=None):
+        if hasattr(KvStore, "_inited"):
+            return
+        KvStore._inited = True
+
+        if redis_uri is None:
+            self.get = self._pass_get
+            self.set = self._pass_set
+            return
+        import redis
+        self._redis_client = redis.StrictRedis.from_url(redis_uri, decode_responses=True)
+        self._redis_client.ping()
+        self.get = self._redis_get
+        self.set = self._redis_set
+
+
+    def __new__(cls, *args, **kwargs):
+        if not hasattr(KvStore, "_instance"):
+            with KvStore._instance_lock:
+                if not hasattr(KvStore, "_instance"):
+                    KvStore._instance = object.__new__(cls)
+        return KvStore._instance
+
+
+    def _pass_get(self, key):
+        return None
+
+    def _pass_set(self, key, value):
+        return True
+
+
+    def _redis_get(self, key):
+        try:
+            return self._redis_client.get(key)
+        except Exception as e:
+            print(f"Redis : {e}")
+            return None
+
+    def _redis_set(self, key, value):
+        try:
+            return self._redis_client.set(key, value)
+        except Exception as e:
+            print(f"Redis : {e}")
+            return False
 
 
 class RemoteSite:
@@ -117,9 +166,11 @@ def requests_download(remote_url: str, dst_file: Path):
                     f.write(chunk)
                     # f.flush()
         os.utime(dst_file, (remote_ts, remote_ts))
+        return r.headers['etag'].strip('"')
 
 
 def downloading_worker(q):
+    stor = KvStore()
     while True:
         item = q.get()
         if item is None:
@@ -132,17 +183,27 @@ def downloading_worker(q):
                 r = requests.head(url, timeout=TIMEOUT_OPTION, allow_redirects=True)
                 remote_filesize = int(r.headers['content-length'])
                 remote_date = parsedate_to_datetime(r.headers['last-modified'])
+                remote_etag = r.headers['etag'].strip('"')
                 stat = dst_file.stat()
                 local_filesize = stat.st_size
                 local_mtime = stat.st_mtime
 
+                try:
+                    etag = stor.get(REDIS_KEY_PREFIX + dst_file.relative_to(working_dir).as_posix())
+                    if etag is not None and etag == remote_etag:
+                        print("skipping etag match", dst_file.relative_to(working_dir), flush=True)
+                        continue
+                except Exception:
+                    pass
+
                 if remote_filesize == local_filesize and remote_date.timestamp() == local_mtime:
-                    print("skipping", dst_file.relative_to(working_dir), flush=True)
+                    print("skipping mtime match", dst_file.relative_to(working_dir), flush=True)
+                    stor.set(REDIS_KEY_PREFIX + dst_file.relative_to(working_dir).as_posix(), remote_etag)
                     continue
 
                 dst_file.unlink()
             print("downloading", url, flush=True)
-            requests_download(url, dst_file)
+            stor.set(REDIS_KEY_PREFIX + dst_file.relative_to(working_dir).as_posix(), requests_download(url, dst_file))
         except Exception:
             traceback.print_exc()
             print("Failed to download", url, flush=True)
@@ -185,8 +246,11 @@ def main():
                         help='number of concurrent downloading jobs')
     parser.add_argument("--fast-skip", action='store_true',
                         help='do not verify size and timestamp of existing package files')
+    parser.add_argument("--redis-cli", default=None,
+                        help='redis client uri')
     args = parser.parse_args()
 
+    KvStore(args.redis_cli)
     if args.working_dir is None:
         raise Exception("Working Directory is None")
 
